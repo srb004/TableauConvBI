@@ -1,0 +1,20 @@
+# Secrets — never commit these
+.env
+.env.*
+!.env.example
+
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS cruft
+.DS_Store
+Thumbs.db
