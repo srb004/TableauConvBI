@@ -65,6 +65,24 @@ st.session_state keys used by this module:
                                every other entry's, including across
                                reruns, because each key is unique per
                                message index.
+    current_session_id     -- id (filename stem) of this conversation's
+                               local save file under saved_chats/, or None
+                               before the first turn. Set the first time a
+                               turn is auto-saved (see chat_history.py);
+                               every later turn overwrites that same file
+                               in place rather than creating a new one, so
+                               one conversation = one file. Reset to None
+                               by "Clear chat" / "Load" so the next turn
+                               starts (or resumes) the right file.
+
+After each turn, the current conversation is auto-saved to a local JSON
+file (chat_history.py / saved_chats/) -- no manual save step. The sidebar's
+"Chat history" expander lists those files and can load one back into
+`messages` or delete it. "Clear chat" just starts a new conversation (the
+old one is already saved). Asking a question also scrolls the page to the
+newest turn via a small injected script (`st.html(..., unsafe_allow_javascript=True)`)
+rather than a boxed/fixed-height chat area, to keep the full-page "ledger"
+layout from design.md intact.
 """
 
 import html
@@ -75,6 +93,8 @@ import time
 import plotly.graph_objects as go
 import streamlit as st
 
+import chat_history as chat_archive  # aliased: "chat_history" is already used
+# below as a local variable name for the LLM's recent-turns context list.
 import llm_agent
 import tableau_client
 
@@ -421,6 +441,37 @@ table.field-ledger-table td.txt {{
 [data-testid="stChatInputSubmitButton"] [data-testid="stIconMaterial"] {{
     color: {PALETTE['petrol']} !important;
 }}
+/* --- Sidebar buttons ("Clear chat", history row actions) -- same fix as
+   the selectbox above: a secondary button's default fill is now the light
+   secondaryBackgroundColor, which would sit under the blanket sidebar
+   paper-text rule as near-invisible light-on-light. Reset to a deliberate
+   translucent-paper fill on ink, petrol on hover -- same treatment as the
+   selectbox so every sidebar control reads as one family. --- */
+[data-testid="stSidebar"] [data-testid^="stBaseButton-secondary"] {{
+    background-color: rgba(245, 246, 243, 0.08) !important;
+    border: 1px solid rgba(245, 246, 243, 0.3) !important;
+    color: {PALETTE['paper']} !important;
+}}
+[data-testid="stSidebar"] [data-testid^="stBaseButton-secondary"]:hover {{
+    border-color: {PALETTE['petrol']} !important;
+    color: {PALETTE['petrol']} !important;
+}}
+[data-testid="stSidebar"] [data-testid^="stBaseButton-secondary"] p {{
+    color: inherit !important;
+}}
+/* Saved-chat history rows (sidebar "Chat history" expander). */
+.ledger-history-meta {{
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.7rem;
+    color: rgba(245, 246, 243, 0.55);
+}}
+.ledger-history-preview {{
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-size: 0.8125rem;
+    color: {PALETTE['paper']};
+    margin: 0.1rem 0 0.35rem 0;
+    overflow-wrap: anywhere;
+}}
 </style>
 """
     st.markdown(css, unsafe_allow_html=True)
@@ -440,7 +491,13 @@ _inject_custom_css()
 
 def _current_secret_values():
     values = []
-    for var in ("TABLEAU_PAT_SECRET", "TABLEAU_PAT_NAME", "AZURE_OPENAI_API_KEY"):
+    for var in (
+        "TABLEAU_PAT_SECRET",
+        "TABLEAU_PAT_NAME",
+        "AZURE_OPENAI_API_KEY",
+        "SNOWFLAKE_CONN_USERNAME",
+        "SNOWFLAKE_CONN_PASSWORD",
+    ):
         raw = os.getenv(var)
         if not raw:
             continue
@@ -527,6 +584,37 @@ if "messages" not in st.session_state:
     st.session_state["messages"] = []
 if "field_metadata_cache" not in st.session_state:
     st.session_state["field_metadata_cache"] = {}
+if "current_session_id" not in st.session_state:
+    st.session_state["current_session_id"] = None
+
+
+def _start_new_chat():
+    """Reset to a blank conversation. Nothing to archive first -- the
+    outgoing conversation (if any) is already saved turn-by-turn (see
+    current_session_id / the end of the "if question:" block below)."""
+    st.session_state["messages"] = []
+    st.session_state["current_session_id"] = None
+    for key in [k for k in st.session_state if k.startswith("chart_type_")]:
+        del st.session_state[key]
+
+
+# ---------------------------------------------------------------------------
+# Sidebar: "New chat" pinned at the very top, above the data source picker,
+# so starting fresh is always one click away without scrolling.
+# ---------------------------------------------------------------------------
+
+if st.sidebar.button(
+    "New chat",
+    icon=":material/add_comment:",
+    type="primary",
+    width="stretch",
+    disabled=not st.session_state["messages"],
+    key="new_chat_button_top",
+    help="Starts a new conversation. This one is already saved to Chat history.",
+):
+    _start_new_chat()
+
+st.sidebar.divider()
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +630,40 @@ selected_datasource = st.sidebar.selectbox(
     key="selected_datasource",
 )
 
+
+def _vds_error_display(exc):
+    """(headline, detail_text) for a VDS-level error (TableauAPIError or
+    VizqlServiceError), per specs/snowflakepassthrough.md 4.3/5: `exc.hint`
+    (when set) is the headline; Tableau's real status/code/message always
+    goes in the detail, for an st.expander."""
+    headline = getattr(exc, "hint", None) or "Tableau returned an error for this data source."
+    detail_parts = []
+    status = getattr(exc, "status", None)
+    code = getattr(exc, "code", None)
+    if status is not None:
+        detail_parts.append(f"HTTP {status}")
+    if code:
+        detail_parts.append(f"Tableau code: {code}")
+    detail_parts.append(sanitize(exc))
+    return headline, "\n".join(detail_parts)
+
+
+_selected_ds_record = next(
+    (ds for ds in st.session_state["datasources"] if ds["name"] == selected_datasource), None
+)
+if _selected_ds_record is not None:
+    try:
+        _conn_status = tableau_client.describe_connection_status(_selected_ds_record["id"])
+        if not _conn_status["live"]:
+            _status_text = "Extract"
+        elif _conn_status["creds_source"] == "app":
+            _status_text = "Live · Snowflake · credentials: from app"
+        else:
+            _status_text = "Live · credentials embedded"
+        st.sidebar.caption(_status_text)
+    except (tableau_client.TableauAuthError, tableau_client.TableauAPIError, tableau_client.VizqlServiceError):
+        pass  # the fields-load error below already surfaces the real problem
+
 fields_available = False
 if selected_datasource not in st.session_state["field_metadata_cache"]:
     try:
@@ -551,11 +673,12 @@ if selected_datasource not in st.session_state["field_metadata_cache"]:
     except tableau_client.DatasourceNotFoundError as exc:
         with st.sidebar.container(key="ledger-alert-sidebar-error"):
             st.error(sanitize(exc))
-    except tableau_client.VizqlServiceError as exc:
+    except (tableau_client.VizqlServiceError, tableau_client.TableauAPIError) as exc:
+        headline, detail = _vds_error_display(exc)
         with st.sidebar.container(key="ledger-alert-sidebar-error"):
-            st.error("Tableau could not return field metadata for this data source.")
+            st.error(headline)
         with st.sidebar.expander("Tableau error details"):
-            st.code(sanitize(exc))
+            st.code(detail)
     except tableau_client.TableauAuthError:
         with st.sidebar.container(key="ledger-alert-sidebar-error"):
             st.error(
@@ -581,6 +704,59 @@ else:
     field_metadata = []
     with st.sidebar.container(key="ledger-alert-sidebar-warning"):
         st.warning("No field metadata is available for this data source yet.")
+
+
+# ---------------------------------------------------------------------------
+# Sidebar: clear chat + locally saved chat history (saved_chats/ on disk,
+# see chat_history.py). Every turn auto-saves (see the end of the "if
+# question:" block below), so there's nothing left to archive here --
+# "Clear chat" just starts a new conversation.
+# ---------------------------------------------------------------------------
+
+st.sidebar.divider()
+st.sidebar.header("Chat")
+
+if st.sidebar.button(
+    "Clear chat",
+    icon=":material/delete_sweep:",
+    width="stretch",
+    disabled=not st.session_state["messages"],
+    key="clear_chat_button",
+    help="Starts a new conversation. This one is already saved to Chat history.",
+):
+    _start_new_chat()
+
+with st.sidebar.expander("Chat history", icon=":material/history:"):
+    saved_sessions = chat_archive.list_sessions()
+    if not saved_sessions:
+        st.caption("No saved conversations yet.")
+    for session in saved_sessions:
+        preview = session["preview"] or "(no question recorded)"
+        if len(preview) > 80:
+            preview = preview[:77] + "..."
+        st.markdown(
+            f'<div class="ledger-history-meta">{html.escape(session["saved_at"])}'
+            f' &middot; {html.escape(session["datasource"])}'
+            f' &middot; {session["message_count"]} messages</div>'
+            f'<div class="ledger-history-preview">{html.escape(preview)}</div>',
+            unsafe_allow_html=True,
+        )
+        with st.container(horizontal=True, wrap=False):
+            if st.button("Load", icon=":material/open_in_new:", key=f"load_hist_{session['id']}"):
+                loaded = chat_archive.load_session(session["id"])
+                if loaded is not None:
+                    # The active conversation (if any) is already saved
+                    # under its own current_session_id -- nothing to
+                    # archive, just switch. Keep this session's id so
+                    # further turns continue updating this same file.
+                    st.session_state["messages"] = loaded.get("messages") or []
+                    st.session_state["current_session_id"] = session["id"]
+            if st.button("Delete", icon=":material/delete:", key=f"delete_hist_{session['id']}"):
+                chat_archive.delete_session(session["id"])
+                if st.session_state.get("current_session_id") == session["id"]:
+                    st.session_state["current_session_id"] = None
+                st.rerun()
+        st.divider()
 
 
 # ---------------------------------------------------------------------------
@@ -1105,11 +1281,12 @@ if question:
                     field_metadata,
                 )
             except (tableau_client.VizqlServiceError, tableau_client.TableauAPIError) as exc:
+                headline, detail = _vds_error_display(exc)
                 _append_and_render(
                     "assistant",
-                    "Tableau returned an error running this query.",
+                    headline,
                     field_metadata,
-                    error_detail=sanitize(exc),
+                    error_detail=detail,
                 )
             except Exception as exc:  # noqa: BLE001
                 _append_and_render(
@@ -1181,3 +1358,27 @@ if question:
                     query_fields=run_fields_for_meta,
                     datasource=selected_datasource,
                 )
+
+    # --- Auto-save this turn locally (no manual "save" step -- see
+    # chat_history.py / saved_chats/ and current_session_id above). ---
+    st.session_state["current_session_id"] = chat_archive.save_session(
+        st.session_state["messages"],
+        selected_datasource,
+        st.session_state["current_session_id"],
+    )
+
+    # --- Scroll the page to this turn's answer. The full-page "ledger"
+    # layout (design.md) has no boxed/fixed-height chat area to auto-scroll
+    # natively, so a tiny injected script does it instead; scoped to this
+    # "if question:" branch so it only fires right after a new turn, never
+    # on an unrelated rerun (switching a chart type, Clear chat, Load). ---
+    st.html(
+        '<div id="ledger-scroll-anchor"></div>'
+        "<script>"
+        "(function () {"
+        "  var el = document.getElementById('ledger-scroll-anchor');"
+        "  if (el) { el.scrollIntoView({behavior: 'smooth', block: 'end'}); }"
+        "})();"
+        "</script>",
+        unsafe_allow_javascript=True,
+    )

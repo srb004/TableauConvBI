@@ -19,6 +19,12 @@ os.getenv (see `.env` in the project root):
     TABLEAU_PAT_NAME      Personal Access Token name
     TABLEAU_PAT_SECRET    Personal Access Token secret
     TABLEAU_DATASOURCE    optional convenience default, used by callers
+    SNOWFLAKE_CONN_USERNAME, SNOWFLAKE_CONN_PASSWORD
+                          optional -- Snowflake pass-through credentials
+                          for live data sources whose Snowflake connection
+                          is not embedded in Tableau. Both are optional:
+                          if either is missing the feature is off and
+                          behavior is unchanged. See _build_vds_datasource.
 
 Known environment gotchas handled here:
 - Windows `set VAR="value"` leaves the literal quote characters in the
@@ -81,13 +87,34 @@ class TableauAuthError(Exception):
 
 class TableauAPIError(Exception):
     """Raised for any other non-2xx response from the Tableau REST API
-    (sign-in, list-datasources)."""
+    (sign-in, list-datasources), and for a VizQL Data Service 401 that
+    persists after one re-sign-in-and-retry -- i.e. a 401 that is proven
+    to NOT be an expired session, since a brand-new session token hit it
+    too. Carries Tableau's real `status`, `code` (parsed from the JSON
+    error body when present), `message`, and the `endpoint` that failed,
+    so callers can show the genuine error instead of guessing "session
+    expired"."""
+
+    def __init__(self, message, status=None, code=None, endpoint=None):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+        self.code = code
+        self.endpoint = endpoint
+        self.hint = None
 
 
 class VizqlServiceError(Exception):
     """Raised when the VizQL Data Service (read-metadata / query-datasource)
-    returns an error. `str(exc)` carries Tableau's actual error text
-    verbatim so the caller can display it (e.g. in an st.expander)."""
+    returns an error that is not a 401 (see TableauAPIError for that case).
+    `str(exc)` carries Tableau's actual error text verbatim so the caller
+    can display it (e.g. in an st.expander). `hint`, when set, is a short
+    human-readable guess at the cause (see `_hint_for_error`)."""
+
+    def __init__(self, message):
+        super().__init__(message)
+        self.message = message
+        self.hint = None
 
 
 class NoDatasourcesError(Exception):
@@ -128,6 +155,44 @@ def _get_env(name, required=True):
 # force a fresh session.
 _session_cache = {"token": None, "site_id": None, "server": None}
 
+# get_connections() results, keyed by datasource_id, for the life of the
+# current Tableau session -- cleared on every sign_in() (a fresh session
+# is the natural point to assume connections may have changed).
+_connections_cache = {}
+
+
+def _secret_values():
+    """Every credential value currently configured, for redaction. Tableau
+    (or Snowflake, via Tableau) can echo a submitted credential back in an
+    error body -- e.g. a bad connectionPassword showing up in its own
+    rejection message -- so every outgoing error message is scrubbed of
+    these before it's ever raised, logged, or shown."""
+    values = []
+    for var in ("TABLEAU_PAT_SECRET", "TABLEAU_PAT_NAME", "SNOWFLAKE_CONN_USERNAME", "SNOWFLAKE_CONN_PASSWORD"):
+        value = _get_env(var, required=False)
+        if value:
+            values.append(value)
+    return values
+
+
+def _redact(text):
+    """Replace any configured secret value found verbatim in `text` with
+    `[REDACTED]`. Always call this on response text / error bodies before
+    they reach an exception message."""
+    text = str(text)
+    for secret in _secret_values():
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    return text
+
+
+def _snowflake_credentials():
+    """Optional Snowflake pass-through credentials from the environment.
+    Both are optional -- the feature is off unless both are set."""
+    return _get_env("SNOWFLAKE_CONN_USERNAME", required=False), _get_env(
+        "SNOWFLAKE_CONN_PASSWORD", required=False
+    )
+
 
 def sign_in():
     """
@@ -167,7 +232,7 @@ def sign_in():
             "TABLEAU_PAT_NAME, TABLEAU_PAT_SECRET, and SITE_NAME."
         )
     if not resp.ok:
-        raise TableauAPIError(f"Sign-in failed: HTTP {resp.status_code} - {resp.text}")
+        raise TableauAPIError(f"Sign-in failed: HTTP {resp.status_code} - {_redact(resp.text)}")
 
     payload = resp.json()
     try:
@@ -180,6 +245,7 @@ def sign_in():
     _session_cache["token"] = token
     _session_cache["site_id"] = site_id
     _session_cache["server"] = server
+    _connections_cache.clear()
 
     return {"token": token, "site_id": site_id, "server": server}
 
@@ -217,7 +283,7 @@ def list_datasources():
     if resp.status_code == 401:
         raise TableauAuthError("Session token was rejected while listing data sources.")
     if not resp.ok:
-        raise TableauAPIError(f"List datasources failed: HTTP {resp.status_code} - {resp.text}")
+        raise TableauAPIError(f"List datasources failed: HTTP {resp.status_code} - {_redact(resp.text)}")
 
     payload = resp.json()
     raw = (payload.get("datasources") or {}).get("datasource") or []
@@ -284,6 +350,154 @@ def find_datasource(name):
     )
 
 
+def get_connections(datasource_id):
+    """
+    List a data source's underlying connection(s) via the REST API.
+
+    Cached per `datasource_id` for the life of the current Tableau session
+    (cleared on the next sign_in()).
+
+    Args:
+        datasource_id: the data source's `id` (see find_datasource).
+
+    Returns:
+        list[dict]: [{"id": str, "type": str, "server_address": str}, ...]
+        Never includes the connection's stored username -- callers must
+        not log or display it either.
+
+    Raises:
+        TableauAuthError: the session token was rejected.
+        TableauAPIError: any other non-2xx response.
+    """
+    if datasource_id in _connections_cache:
+        return _connections_cache[datasource_id]
+
+    session = _ensure_session()
+    url = (
+        f"{session['server']}/api/{REST_API_VERSION}/sites/"
+        f"{session['site_id']}/datasources/{datasource_id}/connections"
+    )
+    headers = {"X-Tableau-Auth": session["token"], "Accept": "application/json"}
+
+    resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+
+    if resp.status_code == 401:
+        raise TableauAuthError("Session token was rejected while fetching data source connections.")
+    if not resp.ok:
+        raise TableauAPIError(
+            f"Get connections failed: HTTP {resp.status_code} - {_redact(resp.text)}",
+            status=resp.status_code,
+            endpoint="connections",
+        )
+
+    payload = resp.json()
+    raw = (payload.get("connections") or {}).get("connection") or []
+    connections = [
+        {"id": c.get("id"), "type": c.get("type"), "server_address": c.get("serverAddress")}
+        for c in raw
+    ]
+    _connections_cache[datasource_id] = connections
+    return connections
+
+
+def _build_vds_datasource(datasource_id):
+    """
+    Build the `datasource` object for a VDS `read-metadata` /
+    `query-datasource` request, attaching Snowflake pass-through
+    credentials when (and only when) they apply.
+
+    Credentials are attached only if BOTH are true:
+      1. SNOWFLAKE_CONN_USERNAME and SNOWFLAKE_CONN_PASSWORD are both set.
+      2. The data source has at least one connection whose `type` contains
+         "snowflake" (case-insensitive).
+    One entry is added per Snowflake connection. `connectionLuid` is
+    included only when there is more than one Snowflake connection -- the
+    proven single-connection request (test_snowflake_passthrough.py)
+    omits it.
+
+    Returns:
+        tuple[dict, bool, bool]: (datasource object, has_snowflake,
+        creds_configured) -- the extra flags let callers compute an
+        accurate error hint if the request later fails.
+    """
+    ds_object = {"datasourceLuid": datasource_id}
+
+    sf_user, sf_password = _snowflake_credentials()
+    creds_configured = bool(sf_user and sf_password)
+
+    connections = get_connections(datasource_id)
+    sf_connections = [c for c in connections if "snowflake" in (c.get("type") or "").lower()]
+    has_snowflake = bool(sf_connections)
+
+    if creds_configured and sf_connections:
+        entries = []
+        for c in sf_connections:
+            entry = {"connectionUsername": sf_user, "connectionPassword": sf_password}
+            if len(sf_connections) > 1:
+                entry["connectionLuid"] = c["id"]
+            entries.append(entry)
+        ds_object["connections"] = entries
+
+    return ds_object, has_snowflake, creds_configured
+
+
+def describe_connection_status(datasource_id):
+    """
+    Human-facing summary of a data source's connection, for display only
+    (e.g. the sidebar status line / diagnose.py) -- never includes a
+    connection's stored username or any secret.
+
+    Returns:
+        dict: {
+            "live": bool,             # False for a published extract
+            "connection_type": str | None,   # Tableau's raw `type`
+            "creds_source": "app" | "embedded" | "none",
+        }
+        "creds_source" is "app" only when this module actually attaches
+        Snowflake pass-through credentials to VDS requests for this data
+        source (see _build_vds_datasource). Any other live connection is
+        reported as "embedded" -- there is no API signal that distinguishes
+        "Tableau already holds working credentials" from "this will 401
+        when queried"; a wrong assumption here still surfaces as a real
+        Tableau error at query time, it just isn't flagged in advance.
+    """
+    connections = get_connections(datasource_id)
+    if not connections:
+        return {"live": False, "connection_type": None, "creds_source": "none"}
+
+    types = {(c.get("type") or "").lower() for c in connections}
+    if types <= {"hyper"}:
+        return {"live": False, "connection_type": "hyper", "creds_source": "none"}
+
+    _, has_snowflake, creds_configured = _build_vds_datasource(datasource_id)
+    connection_type = next((c.get("type") for c in connections if c.get("type")), None)
+    creds_source = "app" if (has_snowflake and creds_configured) else "embedded"
+    return {"live": True, "connection_type": connection_type, "creds_source": creds_source}
+
+
+def _hint_for_error(status, text, has_snowflake, creds_configured):
+    """Short, human-readable guess at the cause of a VDS error, per
+    specs/snowflakepassthrough.md section 4.3. Returns None when nothing
+    matches -- callers should fall back to showing Tableau's raw text."""
+    text = text or ""
+    lower = text.lower()
+
+    if status == 401 and has_snowflake and not creds_configured:
+        return (
+            "This live source needs Snowflake credentials. Set "
+            "SNOWFLAKE_CONN_USERNAME/PASSWORD."
+        )
+    if "403800" in text:
+        return "Token's Tableau user lacks API Access on this data source."
+    if "390422" in text or ("ip" in lower and "not allowed" in lower):
+        return "Snowflake network policy is blocking Tableau Cloud."
+    if "role" in lower and ("not authorized" in lower or "does not exist" in lower):
+        return "Snowflake role can't read this table."
+    if "warehouse" in lower:
+        return "Snowflake user has no usable default warehouse."
+    return None
+
+
 def _vds_headers(session):
     return {
         "X-Tableau-Auth": session["token"],
@@ -292,15 +506,67 @@ def _vds_headers(session):
     }
 
 
-def _post_vds(session, path, body):
+def _extract_error_code(payload):
+    """Best-effort pull of Tableau's own error code out of a VDS error
+    body. Shapes vary (`{"error": {"code": ...}}`, `{"errorCode": ...}`,
+    `{"code": ...}`) so this tries each rather than assuming one."""
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if isinstance(error, dict) and error.get("code"):
+        return error.get("code")
+    return payload.get("code") or payload.get("errorCode")
+
+
+def _extract_error_message(payload, fallback_text):
+    if not isinstance(payload, dict):
+        return fallback_text
+    error = payload.get("error")
+    if isinstance(error, dict):
+        parts = [str(p) for p in (error.get("summary"), error.get("detail")) if p]
+        if parts:
+            return " - ".join(parts)
+    if isinstance(error, str) and error:
+        return error
+    return payload.get("message") or fallback_text
+
+
+def _post_vds(session, path, body, error_context=None, _allow_retry=True):
     """POST to a VizQL Data Service endpoint and return the parsed JSON
     payload, raising the appropriate exception on any error condition
-    (HTTP-level or an `error` key in an otherwise-200 payload)."""
+    (HTTP-level or an `error` key in an otherwise-200 payload).
+
+    On a 401, re-signs in once and retries the same call once with the
+    fresh session before giving up. This is what lets a Snowflake-level
+    401 (bad/missing pass-through creds, blocked network policy, ...) be
+    told apart from a genuinely expired Tableau session: if sign_in()
+    itself fails, that's a real session/credentials problem
+    (TableauAuthError, "session rejected" wording is accurate). If
+    sign_in() succeeds but the retried call still 401s, the session is
+    proven fine -- that's Tableau's real error, raised as TableauAPIError
+    with its actual status/code/message, never "session expired".
+
+    `error_context`, when given, is the `(has_snowflake, creds_configured)`
+    tuple from `_build_vds_datasource` -- used only to compute a more
+    specific `.hint` on failure.
+    """
+    has_snowflake, creds_configured = error_context or (False, False)
     url = f"{session['server']}{path}"
     resp = requests.post(url, json=body, headers=_vds_headers(session), timeout=REQUEST_TIMEOUT_SECONDS)
 
     if resp.status_code == 401:
-        raise TableauAuthError("Session token was rejected by VizQL Data Service.")
+        if _allow_retry:
+            new_session = sign_in()
+            return _post_vds(new_session, path, body, error_context=error_context, _allow_retry=False)
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = None
+        code = _extract_error_code(payload)
+        message = _redact(_extract_error_message(payload, resp.text))
+        exc = TableauAPIError(message, status=401, code=code, endpoint=path)
+        exc.hint = _hint_for_error(401, f"{code or ''} {message}", has_snowflake, creds_configured)
+        raise exc
 
     try:
         payload = resp.json()
@@ -312,13 +578,18 @@ def _post_vds(session, path, body):
             message = payload.get("message") or payload.get("error") or payload
         else:
             message = resp.text
-        raise VizqlServiceError(f"HTTP {resp.status_code}: {message}")
+        message = _redact(message)
+        exc = VizqlServiceError(f"HTTP {resp.status_code}: {message}")
+        exc.hint = _hint_for_error(resp.status_code, str(message), has_snowflake, creds_configured)
+        raise exc
 
     if payload is None:
-        raise VizqlServiceError(f"VizQL Data Service returned a non-JSON response: {resp.text}")
+        raise VizqlServiceError(f"VizQL Data Service returned a non-JSON response: {_redact(resp.text)}")
 
     if isinstance(payload, dict) and payload.get("error"):
-        raise VizqlServiceError(str(payload["error"]))
+        exc = VizqlServiceError(_redact(str(payload["error"])))
+        exc.hint = _hint_for_error(resp.status_code, str(payload["error"]), has_snowflake, creds_configured)
+        raise exc
 
     return payload
 
@@ -331,8 +602,14 @@ def _read_metadata_rows(ds, session):
     pre-aggregated-calculation error) references fields by `fieldName`,
     not `fieldCaption` -- see `run_query`'s retry-on-redundant-aggregation
     handling."""
-    body = {"datasource": {"datasourceLuid": ds["id"]}}
-    payload = _post_vds(session, f"{VDS_BASE_PATH}/read-metadata", body)
+    ds_object, has_snowflake, creds_configured = _build_vds_datasource(ds["id"])
+    body = {"datasource": ds_object}
+    payload = _post_vds(
+        session,
+        f"{VDS_BASE_PATH}/read-metadata",
+        body,
+        error_context=(has_snowflake, creds_configured),
+    )
     return payload.get("data") or []
 
 
@@ -527,21 +804,23 @@ def run_query(name, fields, filters=None):
         else:
             raise ValueError(f"Unsupported filter operator: {f.get('operator')!r}")
 
+    ds_object, has_snowflake, creds_configured = _build_vds_datasource(ds["id"])
+    error_context = (has_snowflake, creds_configured)
     body = {
-        "datasource": {"datasourceLuid": ds["id"]},
+        "datasource": ds_object,
         "query": {"fields": query_fields},
     }
     if query_filters:
         body["query"]["filters"] = query_filters
 
     try:
-        payload = _post_vds(session, f"{VDS_BASE_PATH}/query-datasource", body)
+        payload = _post_vds(session, f"{VDS_BASE_PATH}/query-datasource", body, error_context=error_context)
     except VizqlServiceError as exc:
         retried = _retry_without_redundant_aggregation(str(exc), query_fields, internal_name_by_caption)
         if retried is None:
             raise
         body["query"]["fields"] = retried
-        payload = _post_vds(session, f"{VDS_BASE_PATH}/query-datasource", body)
+        payload = _post_vds(session, f"{VDS_BASE_PATH}/query-datasource", body, error_context=error_context)
 
     return payload.get("data") or []
 

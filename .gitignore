@@ -15,6 +15,9 @@ venv/
 # Streamlit
 .streamlit/secrets.toml
 
+# Locally saved chat conversations (personal data, not project source)
+saved_chats/
+
 # OS cruft
 .DS_Store
 Thumbs.db
