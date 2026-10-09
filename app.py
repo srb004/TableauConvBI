@@ -526,6 +526,12 @@ def ensure_signed_in():
         return
     try:
         st.session_state["tableau_session"] = tableau_client.sign_in()
+    except tableau_client.TableauConnectionError as exc:
+        with st.container(key="ledger-alert-critical-error"):
+            st.error(sanitize(exc.message))
+        with st.expander("Technical details"):
+            st.code(sanitize(exc.details))
+        st.stop()
     except tableau_client.TableauAuthError:
         with st.container(key="ledger-alert-critical-error"):
             st.error(
@@ -553,6 +559,12 @@ def ensure_datasources_loaded():
         return
     try:
         st.session_state["datasources"] = tableau_client.list_datasources()
+    except tableau_client.TableauConnectionError as exc:
+        with st.container(key="ledger-alert-critical-error"):
+            st.error(sanitize(exc.message))
+        with st.expander("Technical details"):
+            st.code(sanitize(exc.details))
+        st.stop()
     except tableau_client.NoDatasourcesError:
         with st.container(key="ledger-alert-critical-error"):
             st.error(
@@ -661,7 +673,12 @@ if _selected_ds_record is not None:
         else:
             _status_text = "Live · credentials embedded"
         st.sidebar.caption(_status_text)
-    except (tableau_client.TableauAuthError, tableau_client.TableauAPIError, tableau_client.VizqlServiceError):
+    except (
+        tableau_client.TableauConnectionError,
+        tableau_client.TableauAuthError,
+        tableau_client.TableauAPIError,
+        tableau_client.VizqlServiceError,
+    ):
         pass  # the fields-load error below already surfaces the real problem
 
 fields_available = False
@@ -670,6 +687,11 @@ if selected_datasource not in st.session_state["field_metadata_cache"]:
         fields = tableau_client.get_datasource_fields(selected_datasource)
         st.session_state["field_metadata_cache"][selected_datasource] = fields
         fields_available = True
+    except tableau_client.TableauConnectionError as exc:
+        with st.sidebar.container(key="ledger-alert-sidebar-error"):
+            st.error(sanitize(exc.message))
+        with st.sidebar.expander("Technical details"):
+            st.code(sanitize(exc.details))
     except tableau_client.DatasourceNotFoundError as exc:
         with st.sidebar.container(key="ledger-alert-sidebar-error"):
             st.error(sanitize(exc))
@@ -1274,6 +1296,13 @@ if question:
                     )
             except tableau_client.DatasourceNotFoundError as exc:
                 _append_and_render("assistant", sanitize(exc), field_metadata)
+            except tableau_client.TableauConnectionError as exc:
+                _append_and_render(
+                    "assistant",
+                    sanitize(exc.message),
+                    field_metadata,
+                    error_detail=sanitize(exc.details),
+                )
             except tableau_client.TableauAuthError:
                 _append_and_render(
                     "assistant",

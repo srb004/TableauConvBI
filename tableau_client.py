@@ -129,6 +129,21 @@ class DatasourceNotFoundError(Exception):
     insensitively, or loosely -- against anything visible to this token."""
 
 
+class TableauConnectionError(Exception):
+    """Raised when a Tableau call never got a response at all -- DNS
+    failure, connection refused, or a timed-out connect/read -- i.e.
+    Tableau Cloud isn't reachable from this machine/network, as opposed to
+    Tableau rejecting the request (that's TableauAuthError/TableauAPIError/
+    VizqlServiceError, which always have a real HTTP response behind them).
+    `message` is the user-facing sentence; `details` carries the original
+    requests exception text for an expander, never a raw traceback."""
+
+    def __init__(self, message, details=None):
+        super().__init__(message)
+        self.message = message
+        self.details = details
+
+
 def _clean(value):
     """Strip whitespace and surrounding quote characters left behind by
     Windows `set VAR="value"` (or a `.env` file written the same way)."""
@@ -194,6 +209,30 @@ def _snowflake_credentials():
     )
 
 
+_UNREACHABLE_MESSAGE = (
+    "Can't reach Tableau Cloud from this computer. Check internet/VPN, or "
+    "set HTTPS_PROXY if your network uses a proxy."
+)
+
+
+def _request(method, url, **kwargs):
+    """Thin wrapper around requests.post/requests.get that turns a
+    network-level failure (DNS, connection refused, timed-out connect/
+    read) into TableauConnectionError with a clear, non-technical message.
+    Every requests call in this module goes through here so none of them
+    can surface a raw traceback for an unreachable server -- the original
+    exception text is kept on `.details` for an expander.
+
+    Dispatches to `requests.post`/`requests.get` (rather than the generic
+    `requests.request`) so tests can keep patching those two names
+    directly, same as before this wrapper existed."""
+    call = requests.post if method.upper() == "POST" else requests.get
+    try:
+        return call(url, **kwargs)
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+        raise TableauConnectionError(_UNREACHABLE_MESSAGE, details=str(exc)) from exc
+
+
 def sign_in():
     """
     Sign in to Tableau Server/Cloud using a Personal Access Token.
@@ -224,7 +263,7 @@ def sign_in():
     }
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
 
-    resp = requests.post(url, json=body, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+    resp = _request("POST", url, json=body, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
 
     if resp.status_code == 401:
         raise TableauAuthError(
@@ -278,7 +317,7 @@ def list_datasources():
     headers = {"X-Tableau-Auth": session["token"], "Accept": "application/json"}
     params = {"pageSize": 1000}
 
-    resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+    resp = _request("GET", url, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
 
     if resp.status_code == 401:
         raise TableauAuthError("Session token was rejected while listing data sources.")
@@ -379,7 +418,7 @@ def get_connections(datasource_id):
     )
     headers = {"X-Tableau-Auth": session["token"], "Accept": "application/json"}
 
-    resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+    resp = _request("GET", url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
 
     if resp.status_code == 401:
         raise TableauAuthError("Session token was rejected while fetching data source connections.")
@@ -552,7 +591,7 @@ def _post_vds(session, path, body, error_context=None, _allow_retry=True):
     """
     has_snowflake, creds_configured = error_context or (False, False)
     url = f"{session['server']}{path}"
-    resp = requests.post(url, json=body, headers=_vds_headers(session), timeout=REQUEST_TIMEOUT_SECONDS)
+    resp = _request("POST", url, json=body, headers=_vds_headers(session), timeout=REQUEST_TIMEOUT_SECONDS)
 
     if resp.status_code == 401:
         if _allow_retry:

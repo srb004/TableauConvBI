@@ -30,17 +30,24 @@ def _read_metadata_status(ds_name):
         return "SESSION REJECTED", ""
     except tc.DatasourceNotFoundError:
         return "NOT FOUND", ""
+    except tc.TableauConnectionError:
+        return "UNREACHABLE", ""
 
 
 def _connection_status(ds_id):
     try:
         return tc.describe_connection_status(ds_id)
-    except (tc.TableauAuthError, tc.TableauAPIError):
+    except (tc.TableauAuthError, tc.TableauAPIError, tc.TableauConnectionError):
         return {"live": None, "connection_type": None, "creds_source": "none"}
 
 
 def main():
-    datasources = tc.list_datasources()
+    try:
+        datasources = tc.list_datasources()
+    except tc.TableauConnectionError as exc:
+        print(exc.message)
+        print(f"({exc.details})")
+        return
 
     rows = []
     for ds in datasources:
